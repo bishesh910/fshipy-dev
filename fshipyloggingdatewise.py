@@ -1,99 +1,110 @@
 import requests
 import json
 import os
+import logging
 import datetime
 from datetime import datetime
-import inotify.adapters
+from requests.exceptions import RequestException
+from concurrent.futures import ThreadPoolExecutor
 import urllib3
-import logging
-from logging.handlers import TimedRotatingFileHandler
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-current_DT = datetime.now()
-
-formatted_datetime = current_DT.strftime("%Y-%m-%d %H:%M:%S")
-
-# Set up logging with timed rotation
-log_dir = '/var/log/fshipy'
-log_file_path = os.path.join(log_dir, 'fshipy.log')
-
-# Create the log directory if it doesn't exist
-os.makedirs(log_dir, exist_ok=True)
-
-# Set up TimedRotatingFileHandler
-handler = TimedRotatingFileHandler(log_file_path, when="midnight", interval=1, backupCount=5)  # rotate daily, keep 5 backup files
-handler.setLevel(logging.INFO)
-handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-
+# Configure logging to write to a file
+log_file_path = '/etc/fshipy/log/fshipy.log'
 logging.basicConfig(
     level=logging.INFO,
-    handlers=[handler]
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    handlers=[
+        logging.StreamHandler(),  # Log to console
+        logging.FileHandler(log_file_path)  # Log to file
+    ],
+    force=True  # Ensure that the root logger is reconfigured
 )
+logger = logging.getLogger(__name__)
+
+MASTER_URL = "https://indexer.loadbalancer:9200/_cat/master?h=node"
+
+try:
+    MASTER_INDEXER = requests.get(MASTER_URL, verify=False)
+    MASTER_INDEXER.raise_for_status()
+    response_content = MASTER_INDEXER.text
+except RequestException as e:
+    logger.error('Error fetching master node: %s', e)
+    raise SystemExit("Exiting due to an error")
 
 # Set the OpenSearch endpoint
-url_base = os.environ['INDEXER_URL']
+url_base = "http://" + response_content.strip() + ":9200/"
 
-# Set the headers
-headers = {
-    'Content-Type': 'application/json',
-}
+CHECKPOINT_FILE = '/etc/fshipy/checkpoint.txt'
 
-# Set the authentication credentials if needed
-auth = (os.environ['INDEXER_USER'], os.environ['INDEXER_PASSWORD'])
+def read_checkpoint():
+    try:
+        with open(CHECKPOINT_FILE, 'r') as checkpoint_file:
+            return int(checkpoint_file.read().strip())
+    except FileNotFoundError:
+        return 0
 
-# Function to send the bulk request
-def send_bulk_request(url, bulk_request):
-    response = requests.post(url, headers=headers, auth=auth, data=bulk_request, verify=False)
-    if response.status_code == 200:
-        print(f'{formatted_datetime} Bulk request successful:')
-        logging.info('Bulk request successful:')
-    else:
-        logging.error('Error in bulk request:')
-        logging.error(f'Status Code: {response.status_code}')
-        logging.error(response.text)
+def write_checkpoint(index):
+    with open(CHECKPOINT_FILE, 'w') as checkpoint_file:
+        checkpoint_file.write(str(index))
 
-# Main function
+def send_bulk_request(url, headers, bulk_request):
+    try:
+        response = requests.post(url, headers=headers, data=bulk_request)
+        response.raise_for_status()
+        return response
+    except RequestException as e:
+        logger.error('Error sending bulk request: %s', e)
+        raise  # Re-raise the exception to stop the script
+
+def process_chunk(chunk_logs, chunk_start, url, headers):
+    bulk_request = ""
+    for index, log in enumerate(chunk_logs, start=chunk_start):
+        action = {
+            "index": {
+                "_index": "saycure",
+            }
+        }
+        bulk_request += json.dumps(action) + "\n" + log
+
+    return send_bulk_request(url, headers, bulk_request)
+
 def main():
-    # Set the path to the JSON file
-    file_path = '/var/ossec/logs/alerts/alerts.json'
-
-    # Set the OpenSearch index URL
+    json_file_path = '/var/ossec/logs/alerts/alerts.json'
     current_date = datetime.now().strftime("%m-%d-%Y")
-    index_name = f'saycure-{current_date}'
+    index_name = f'saycure-alerts-{current_date}'
     url = f'{url_base}{index_name}/_bulk'
-
-    # Set up inotify
-    i = inotify.adapters.Inotify()
-
-    # Add the file to watch for modifications
-    i.add_watch(file_path)
+    headers = {'Content-Type': 'application/json'}
+    chunk_size = 1000
 
     try:
-        for event in i.event_gen(yield_nones=False):
-            (_, type_names, path, filename) = event
-            if "IN_MODIFY" in type_names:
-                print(f'File {path}/{filename} has been modified. Sending bulk request...')
-                with open(file_path, 'r') as file:
-                    logs = file.readlines()
+        with open(json_file_path, 'r') as file:
+            logs = file.readlines()
 
-                # Prepare the bulk request
-                bulk_request = ""
-                for index, log in enumerate(logs, start=1):
-                    action = {
-                        "index": {
-                            "_index": index_name,
-                        }
-                    }
-                    bulk_request += json.dumps(action) + "\n" + log + "\n"
+        last_processed_index = read_checkpoint()
 
-                # Send the bulk request
-                send_bulk_request(url, bulk_request)
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            for i in range(last_processed_index, len(logs), chunk_size):
+                chunk_logs = logs[i:i + chunk_size]
+                future = executor.submit(process_chunk, chunk_logs, i + 1, url, headers)
+                futures.append((i + 1, i + len(chunk_logs), future))
+
+            for start, end, future in futures:
+                try:
+                    response = future.result()
+                    logger.info('Bulk request successful for chunk %d-%d', start, end)
+                    logger.debug('Response: %s', response.text)
+                    last_processed_index = end
+                    write_checkpoint(end)  # Update checkpoint after successful processing
+                except Exception as e:
+                    logger.error('Error processing chunk %d-%d: %s', start, end, e)
 
     except KeyboardInterrupt:
-        pass
-    finally:
-        i.remove_watch(file_path)
+        logger.error('Script interrupted by user')
+        raise SystemExit("Exiting due to user interruption")
 
 if __name__ == "__main__":
     main()

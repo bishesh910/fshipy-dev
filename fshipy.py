@@ -6,9 +6,8 @@ import datetime
 from datetime import datetime
 from requests.exceptions import RequestException
 from concurrent.futures import ThreadPoolExecutor
-import time  # Import the time module
+import time
 import urllib3
-
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -77,10 +76,9 @@ def process_chunk(chunk_logs, chunk_start, url, headers, auth, index_name):
 
     return send_bulk_request(url, headers, auth, bulk_request)
 
-
 def main():
     json_file_path = '/var/ossec/logs/alerts/alerts.json'
-    interval_seconds = 60  # Adjust this value based on your needs
+    interval_seconds = 1  # Adjust this value based on your needs
     auth = ('admin', 'CRsaycure2k23')
     chunk_size = 500
 

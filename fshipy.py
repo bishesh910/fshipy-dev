@@ -90,10 +90,6 @@ def main():
             current_modified_time = os.path.getmtime(json_file_path)
             if current_modified_time != last_modified_time:
                 last_modified_time = current_modified_time
-
-                current_date = datetime.now().strftime("%m-%d-%Y")
-                index_name = f'saycure-{current_date}'  # Modified index name
-                url = f'{url_base}{index_name}/_bulk'
                 headers = {'Content-Type': 'application/json'}
 
                 with open(json_file_path, 'r') as file:
@@ -104,6 +100,9 @@ def main():
                 with ThreadPoolExecutor(max_workers=5) as executor:
                     futures = []
                     for i in range(last_processed_index, len(logs), chunk_size):
+                        current_date = datetime.now().strftime("%m-%d-%Y")
+                        index_name = f'saycure-{current_date}'  # Modified index name
+                        url = f'{url_base}{index_name}/_bulk'
                         chunk_logs = logs[i:i + chunk_size]
                         future = executor.submit(process_chunk, chunk_logs, i + 1, url, headers, auth, index_name)
                         futures.append((i + 1, i + len(chunk_logs), future))

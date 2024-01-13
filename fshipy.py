@@ -1,17 +1,16 @@
-import requests
+#Import Modules
+import re
+import ijson
 import json
-import os
+import requests
 import logging
-import datetime
+import os
 from datetime import datetime
 from requests.exceptions import RequestException
 from concurrent.futures import ThreadPoolExecutor
 import time
 import urllib3
 import subprocess
-
-
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configure logging to write to a file
 log_file_path = '/etc/fshipy/log/fshipy.log'
@@ -27,6 +26,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+#Disable SSL warning.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+#Request the loadbalancer to get master node.
 MASTER_URL = "https://loadbalancer.saycure.io:9200/_cat/master?h=node"
 auth_credentials = ('admin', 'CRsaycure2k23')
 try:
@@ -37,12 +41,15 @@ except RequestException as e:
     logger.error('Error fetching master node: %s', e)
     raise SystemExit("Exiting due to an error")
 
-# Set the OpenSearch endpoint
-url_base = "https://" + response_content.strip() + ":9200/"  # Change from http to https
+#Set the Endpoint master node to send the logs to.
+url_base = "https://" + response_content.strip() + ":9200/"
 
+#Create files for pointer and day rotation.
 EPOCH_FILE = '/etc/fshipy/epoch/epoch.pos'
 CHECKPOINT_FILE = '/etc/fshipy/pointer/pointer.pos'
 
+#Functions
+#Define a function to read the checkpoint from the file. If the file is not found, return 0.
 def read_checkpoint():
     try:
         with open(CHECKPOINT_FILE, 'r') as checkpoint_file:
@@ -50,14 +57,17 @@ def read_checkpoint():
     except FileNotFoundError:
         return 0
 
+#Define a function to write the checkpoint to the file.
 def write_checkpoint(index):
     with open(CHECKPOINT_FILE, 'w') as checkpoint_file:
         checkpoint_file.write(str(index))
 
+#Define a function to reset the checkpoint when the index is rotated for the day.
 def reset_checkpoint():
     logger.info('Rotated index for today')
     write_checkpoint(0)
 
+#Define a function to send a bulk request to the OpenSearch cluster.
 def send_bulk_request(url, headers, auth, bulk_request):
     try:
         response = requests.post(url, headers=headers, auth=auth, data=bulk_request, verify=False)
@@ -68,6 +78,41 @@ def send_bulk_request(url, headers, auth, bulk_request):
         logger.debug('Bulk Request Content: %s', bulk_request)  # Add this line for debugging
         raise
 
+#Define a function to read the last processed epoch time from the file. If the file is not found, return 0.
+def read_last_processed_epoch_time():
+    try:
+        with open(EPOCH_FILE, 'r') as epoch_file:
+            return int(epoch_file.read().strip())
+    except FileNotFoundError:
+        return 0
+
+#Define a function to write the last processed epoch time to the file.
+def write_last_processed_epoch_time(index):
+    with open(EPOCH_FILE, 'w') as epoch_file:
+        epoch_file.write(str(index))
+
+#Define a function to check the birth time of a specific file.
+def rotationfilecheck():
+    command = "stat -c %W /var/ossec/logs/alerts/alerts.json"
+    birth_of_file = int(subprocess.check_output(command, shell=True, text=True))
+    return birth_of_file
+
+# Define a function to read logs from a specified file
+def read_logs(file_path):
+    with open(file_path, 'r') as file:
+        content = file.read()
+        # Split concatenated JSON objects by either ',' or '\n'
+        json_objects = [obj.strip() for obj in re.split(r'\n', content) if obj.strip()]
+
+        for json_object in json_objects:
+            try:
+                parsed_json = json.loads(json_object)
+                yield json_object
+            except json.JSONDecodeError as json_error:
+                logger.error('Error decoding JSON: %s', str(json_error))
+                logger.error('Problematic log: %s', json_object)
+
+#Define Chunk Processing Function
 def process_chunk(chunk_logs, chunk_start, url, headers, auth, index_name):
     bulk_request = []
     num_logs = len(chunk_logs)  # Get the number of logs in the chunk
@@ -75,13 +120,21 @@ def process_chunk(chunk_logs, chunk_start, url, headers, auth, index_name):
 
     for index, log in enumerate(chunk_logs, start=chunk_start):
         try:
+            # Remove the extra curly braces around the timestamp key
             action = {
                 "index": {
                     "_index": index_name,
                 }
             }
-            log_entry = {"index": {"_index": index_name}}  # Include the index action
-            log_entry.update(json.loads(log))  # Add the log data
+
+            log_items = list(ijson.items(log, ''))
+            if len(log_items) > 1:
+                # Merge all items into a single dictionary
+                log_entry = dict(log_items)
+            else:
+                # Handle the case where there is only one item in the tuple
+                log_entry = log_items[0]
+
 
             # Debug log statement to print the content of each log
             logger.debug('Processing log: %s', json.dumps(log_entry))
@@ -94,6 +147,10 @@ def process_chunk(chunk_logs, chunk_start, url, headers, auth, index_name):
             logger.error('Problematic log: %s', log)
 
     try:
+        if not bulk_request:
+            logger.warning('Empty bulk request, skipping...')
+            return
+
         # Create the entire bulk request by joining the log entries with newline characters
         bulk_request_text = "\n".join(bulk_request) + "\n"
 
@@ -110,42 +167,30 @@ def process_chunk(chunk_logs, chunk_start, url, headers, auth, index_name):
         # Raise the exception again to terminate the script
         raise
 
-
-def read_last_processed_epoch_time():
-    try:
-        with open(EPOCH_FILE, 'r') as epoch_file:
-            return int(epoch_file.read().strip())
-    except FileNotFoundError:
-        return 0
-
-def write_last_processed_epoch_time(index):
-    with open(EPOCH_FILE, 'w') as epoch_file:
-        epoch_file.write(str(index))
-
-def rotationfilecheck():
-     command = "stat -c %W /var/ossec/logs/alerts/alerts.json"
-     birth_of_file = int(subprocess.check_output(command, shell=True, text=True))
-     return birth_of_file
-
 def main():
     json_file_path = '/var/ossec/logs/alerts/alerts.json'
-    interval_seconds = 10  # Adjust this value based on your needs
+    interval_seconds = 5  # Adjust this value based on your needs
     auth = ('admin', 'CRsaycure2k23')
-    chunk_size = 500
+    chunk_size = 5
     last_processed_epoch_time = read_last_processed_epoch_time()
 
     try:
         last_modified_time = 0  # Initialize last_modified_time outside the loop
 
         while True:
-            # Check if the file has been modified
             current_modified_time = os.path.getmtime(json_file_path)
             if current_modified_time != last_modified_time:
                 last_modified_time = current_modified_time
                 headers = {'Content-Type': 'application/json'}
 
-                with open(json_file_path, 'r') as file:
-                    logs = file.readlines()
+                logs_generator = read_logs(json_file_path)
+                logs = []
+                try:
+                    while True:
+                        log_entry = next(logs_generator)
+                        logs.append(log_entry)
+                except StopIteration:
+                    pass
 
                 with ThreadPoolExecutor(max_workers=5) as executor:
                     futures = []
@@ -156,7 +201,6 @@ def main():
 
                     last_processed_index = read_checkpoint()
                     for i in range(last_processed_index, len(logs), chunk_size):
-                        # Check if a new day has started
                         current_date = datetime.now().strftime("%m-%d-%Y")
                         index_name = f'saycure-{current_date}'
                         url = f'{url_base}{index_name}/_bulk'
@@ -172,15 +216,15 @@ def main():
                             logger.debug('Response: %s', response.text)
                             last_processed_index = end
                             last_processed_timestamp = int(time.time())
-                            write_checkpoint(end)  # Update checkpoint after successful processing
+                            write_checkpoint(end)
                             write_last_processed_epoch_time(last_processed_timestamp)
                         except Exception as e:
                             logger.error(f'Error processing chunk %d-%d: %s', start, end, str(e))
                             if hasattr(e, 'response'):
                                 logger.error('Response content: %s', e.response.text)
-                            logger.debug('Chunk content: %s', '\n'.join(chunk_logs))  # Add this line for debugging
+                            logger.debug('Chunk content: %s', '\n'.join(chunk_logs))
 
-            time.sleep(interval_seconds)  # Wait before checking again
+            time.sleep(interval_seconds)
 
     except KeyboardInterrupt:
         logger.error('Script interrupted by user')
